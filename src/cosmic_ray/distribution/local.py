@@ -24,9 +24,7 @@ class LocalDistributor(Distributor):
 
     def __call__(self, pending_work, test_command, timeout, _distributor_config, on_task_complete):
         for work_item in pending_work:
-            result = mutate_and_test(
+            result = get_mutations_only(
                 mutations=work_item.mutations,
-                test_command=test_command,
-                timeout=timeout,
             )
             on_task_complete(work_item.job_id, result)

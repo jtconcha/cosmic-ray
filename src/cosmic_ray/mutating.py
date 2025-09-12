@@ -223,3 +223,132 @@ def _make_diff(original_source, mutated_source, module_path):
     ):
         module_diff.append(line)
     return module_diff
+
+def get_mutation(module_path, operator, occurrence) -> Tuple[str, Optional[str]]:
+    """Get a mutation without applying it to disk.
+    
+    Args:
+        module_path: The path to the module to mutate.
+        operator: The `operator` instance to use.
+        occurrence: The occurrence of the operator to apply.
+
+    Returns:
+        A `(unmutated-code, mutated-code)` tuple. If there was no mutation performed, 
+        the `mutated-code` is `None`.
+    """
+    log.info("Getting mutation: path=%s, op=%s, occurrence=%s", module_path, operator, occurrence)
+    original_code = read_python_source(module_path)
+    mutated_code = MutationVisitor.mutate_code(original_code, operator, occurrence)
+    return original_code, mutated_code
+
+def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
+    """Generate mutations without executing the test command.
+
+    This collects the original and mutated source for each mutation spec and
+    writes them to ``mutations.json`` in the current working directory.
+
+    Returns a ``WorkResult`` whose ``worker_outcome`` is NORMAL if at least one
+    mutation produced code, or NO_TEST if none did.
+    """
+    mutations_dict: dict[Path, tuple[str, str]] = {}
+    mutation_records = []
+
+    try:
+        for mutation in mutations:
+            try:
+                operator_class = cosmic_ray.plugins.get_operator(mutation.operator_name)
+                try:
+                    operator_args = mutation.operator_args
+                except AttributeError:
+                    operator_args = {}
+                operator = operator_class(**operator_args)
+
+                original_code, mutated_code = get_mutation(mutation.module_path, operator, mutation.occurrence)
+                status = 'mutated' if mutated_code is not None else 'no_mutation'
+                if mutated_code is not None:
+                    mutations_dict[mutation.module_path] = (original_code, mutated_code)
+                diff_lines = _make_diff(original_code, mutated_code, mutation.module_path) if mutated_code else []
+                mutation_records.append({
+                    "module_path": str(mutation.module_path),
+                    "operator_name": mutation.operator_name,
+                    "occurrence": mutation.occurrence,
+                    "start_pos": mutation.start_pos,
+                    "end_pos": mutation.end_pos,
+                    "operator_args": getattr(mutation, 'operator_args', {}),
+                    "original": original_code,
+                    "mutated": mutated_code,
+                    "diff": "\n".join(diff_lines) if diff_lines else None,
+                    "status": status,
+                })
+            except Exception:
+                mutation_records.append({
+                    "module_path": str(getattr(mutation, 'module_path', 'UNKNOWN')),
+                    "operator_name": getattr(mutation, 'operator_name', 'UNKNOWN'),
+                    "occurrence": getattr(mutation, 'occurrence', -1),
+                    "start_pos": None,
+                    "end_pos": None,
+                    "operator_args": getattr(mutation, 'operator_args', {}),
+                    "original": None,
+                    "mutated": None,
+                    "diff": None,
+                    "status": 'error',
+                    "error": traceback.format_exc(),
+                })
+
+        any_error = any(r.get('status') == 'error' for r in mutation_records)
+        any_mutated = any(r.get('status') == 'mutated' for r in mutation_records)
+
+        output_path = Path("mutations.json")
+        existing: list = []
+        if output_path.exists():
+            try:
+                with output_path.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        existing = data
+                    else:
+                        existing = [data]
+            except Exception:
+                log.warning("Failed reading existing mutations.json; starting fresh", exc_info=True)
+                existing = []
+
+        def _key(rec):
+            return (
+                rec.get('module_path'),
+                rec.get('operator_name'),
+                rec.get('occurrence'),
+                tuple(rec.get('start_pos') or []),
+                tuple(rec.get('end_pos') or []),
+                rec.get('status'),
+            )
+
+        merged = { _key(r): r for r in existing }
+        for rec in mutation_records:
+            merged[_key(rec)] = rec
+        final_records = list(merged.values())
+
+        with output_path.open("w", encoding="utf-8") as fh:
+            json.dump(final_records, fh, indent=2)
+        log.info("Stored %d total mutation records (%d new) in %s", len(final_records), len(mutation_records), output_path.resolve())
+
+        if any_error:
+            worker_outcome = WorkerOutcome.EXCEPTION
+            test_outcome = TestOutcome.INCOMPETENT
+        elif any_mutated:
+            worker_outcome = WorkerOutcome.NORMAL
+            test_outcome = TestOutcome.NO_TEST
+        else:
+            worker_outcome = WorkerOutcome.NO_TEST
+            test_outcome = TestOutcome.NO_TEST
+
+        return WorkResult(
+            worker_outcome=worker_outcome,
+            test_outcome=test_outcome,
+            output=f"Recorded {len(mutation_records)} records; total now {len(final_records)}"
+        )
+    except Exception:
+        return WorkResult(
+            output=traceback.format_exc(),
+            test_outcome=TestOutcome.INCOMPETENT,
+            worker_outcome=WorkerOutcome.EXCEPTION,
+        )
