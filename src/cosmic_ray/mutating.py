@@ -14,6 +14,8 @@ from cosmic_ray.ast import Visitor, get_ast
 from cosmic_ray.testing import run_tests
 from cosmic_ray.util import read_python_source, restore_contents
 from cosmic_ray.work_item import MutationSpec, TestOutcome, WorkResult, WorkerOutcome
+from typing import Optional
+import json
 
 log = logging.getLogger(__name__)
 
@@ -224,7 +226,7 @@ def _make_diff(original_source, mutated_source, module_path):
         module_diff.append(line)
     return module_diff
 
-def get_mutation(module_path, operator, occurrence) -> Tuple[str, Optional[str]]:
+def get_mutation(module_path, operator, occurrence) -> tuple[str, Optional[str]]:
     """Get a mutation without applying it to disk.
     
     Args:
@@ -233,7 +235,7 @@ def get_mutation(module_path, operator, occurrence) -> Tuple[str, Optional[str]]
         occurrence: The occurrence of the operator to apply.
 
     Returns:
-        A `(unmutated-code, mutated-code)` tuple. If there was no mutation performed, 
+        A `(unmutated-code, mutated-code)` . If there was no mutation performed, 
         the `mutated-code` is `None`.
     """
     log.info("Getting mutation: path=%s, op=%s, occurrence=%s", module_path, operator, occurrence)
@@ -250,7 +252,6 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
     Returns a ``WorkResult`` whose ``worker_outcome`` is NORMAL if at least one
     mutation produced code, or NO_TEST if none did.
     """
-    mutations_dict: dict[Path, tuple[str, str]] = {}
     mutation_records = []
 
     try:
@@ -265,8 +266,7 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
 
                 original_code, mutated_code = get_mutation(mutation.module_path, operator, mutation.occurrence)
                 status = 'mutated' if mutated_code is not None else 'no_mutation'
-                if mutated_code is not None:
-                    mutations_dict[mutation.module_path] = (original_code, mutated_code)
+
                 diff_lines = _make_diff(original_code, mutated_code, mutation.module_path) if mutated_code else []
                 mutation_records.append({
                     "module_path": str(mutation.module_path),
@@ -275,8 +275,7 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                     "start_pos": mutation.start_pos,
                     "end_pos": mutation.end_pos,
                     "operator_args": getattr(mutation, 'operator_args', {}),
-                    "original": original_code,
-                    "mutated": mutated_code,
+                    "mutated": extract_span(mutated_code, mutation.start_pos, mutation.end_pos),
                     "diff": "\n".join(diff_lines) if diff_lines else None,
                     "status": status,
                 })
@@ -288,7 +287,6 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                     "start_pos": None,
                     "end_pos": None,
                     "operator_args": getattr(mutation, 'operator_args', {}),
-                    "original": None,
                     "mutated": None,
                     "diff": None,
                     "status": 'error',
@@ -352,3 +350,34 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
             test_outcome=TestOutcome.INCOMPETENT,
             worker_outcome=WorkerOutcome.EXCEPTION,
         )
+
+def extract_span(code: str, start_pos: list[int], end_pos: list[int]) -> str:
+    """
+    Return the substring between start_pos (inclusive) and end_pos (exclusive).
+
+    Handles multi-line strings and gracefully fails on invalid input.
+    """
+    if code is None:
+        raise ValueError("Input 'code' cannot be None.")
+
+    lines = code.splitlines() 
+    start_line, start_col = start_pos
+    end_line, end_col = end_pos
+
+    start_idx = start_line - 1
+    end_idx = end_line - 1
+
+    if not (0 <= start_idx < len(lines) and 0 <= end_idx < len(lines)):
+        raise ValueError(f"Line index out of range. Got lines {start_line}-{end_line}, but code has only {len(lines)} lines.")
+
+    if start_idx == end_idx:
+        return lines[start_idx][start_col:end_col]
+
+
+    parts = []
+    parts.append(lines[start_idx][start_col:])
+    for i in range(start_idx + 1, end_idx):
+        parts.append(lines[i])
+    parts.append(lines[end_idx][:end_col])
+    
+    return "\n".join(parts)

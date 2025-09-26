@@ -14,7 +14,7 @@ To use the local distributor, set ``cosmic-ray.distributor.name = "local"`` in y
 import logging
 
 from cosmic_ray.distribution.distributor import Distributor
-from cosmic_ray.mutating import mutate_and_test
+from cosmic_ray.mutating import mutate_and_test, get_mutations_only
 
 log = logging.getLogger(__name__)
 
