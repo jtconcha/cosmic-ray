@@ -8,6 +8,8 @@ from collections.abc import Iterable
 from contextlib import contextmanager
 from itertools import chain
 from pathlib import Path
+import ast
+
 
 import cosmic_ray.plugins
 from cosmic_ray.ast import Visitor, get_ast
@@ -267,6 +269,13 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                 original_code, mutated_code = get_mutation(mutation.module_path, operator, mutation.occurrence)
                 status = 'mutated' if mutated_code is not None else 'no_mutation'
 
+                context_node = find_context(mutated_code, mutation.start_pos[0])
+
+                if context_node:
+                    node_source = ast.get_source_segment(mutated_code, context_node)
+                else:
+                    node_source = None
+
                 diff_lines = _make_diff(original_code, mutated_code, mutation.module_path) if mutated_code else []
                 mutation_records.append({
                     "module_path": str(mutation.module_path),
@@ -275,7 +284,8 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                     "start_pos": mutation.start_pos,
                     "end_pos": mutation.end_pos,
                     "operator_args": getattr(mutation, 'operator_args', {}),
-                    "mutated": extract_span(mutated_code, mutation.start_pos, mutation.end_pos),
+                    "mutation": extract_mutated_line(mutated_code, mutation.start_pos, mutation.end_pos) if mutated_code else None,
+                    "mutated_code": node_source,
                     "diff": "\n".join(diff_lines) if diff_lines else None,
                     "status": status,
                 })
@@ -287,7 +297,8 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                     "start_pos": None,
                     "end_pos": None,
                     "operator_args": getattr(mutation, 'operator_args', {}),
-                    "mutated": None,
+                    "mutation": None,
+                    "mutated_code": None,
                     "diff": None,
                     "status": 'error',
                     "error": traceback.format_exc(),
@@ -351,33 +362,35 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
             worker_outcome=WorkerOutcome.EXCEPTION,
         )
 
-def extract_span(code: str, start_pos: list[int], end_pos: list[int]) -> str:
-    """
-    Return the substring between start_pos (inclusive) and end_pos (exclusive).
 
-    Handles multi-line strings and gracefully fails on invalid input.
+def find_context(code: str, line: int):
+    tree = ast.parse(code)
+
+    def node_span(node):
+        if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+            return node.lineno, node.end_lineno
+        if hasattr(node, "lineno"):
+            return node.lineno, node.lineno
+        return None
+
+    enclosing = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            span = node_span(node)
+            if span and span[0] <= line <= span[1]:
+                if enclosing is None or span[0] >= enclosing[1]:
+                    enclosing = (node, span)
+    return enclosing[0] if enclosing else None
+
+def extract_mutated_line(code: str, start_pos: list[int], end_pos: list[int]) -> str:
+    """
+    Return the line where the mutation is located at.
     """
     if code is None:
         raise ValueError("Input 'code' cannot be None.")
 
     lines = code.splitlines() 
     start_line, start_col = start_pos
-    end_line, end_col = end_pos
-
     start_idx = start_line - 1
-    end_idx = end_line - 1
 
-    if not (0 <= start_idx < len(lines) and 0 <= end_idx < len(lines)):
-        raise ValueError(f"Line index out of range. Got lines {start_line}-{end_line}, but code has only {len(lines)} lines.")
-
-    if start_idx == end_idx:
-        return lines[start_idx][start_col:end_col]
-
-
-    parts = []
-    parts.append(lines[start_idx][start_col:])
-    for i in range(start_idx + 1, end_idx):
-        parts.append(lines[i])
-    parts.append(lines[end_idx][:end_col])
-    
-    return "\n".join(parts)
+    return lines[start_idx]
