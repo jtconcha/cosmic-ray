@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from itertools import chain
 from pathlib import Path
 import ast
+import re
 
 
 import cosmic_ray.plugins
@@ -16,10 +17,20 @@ from cosmic_ray.ast import Visitor, get_ast
 from cosmic_ray.testing import run_tests
 from cosmic_ray.util import read_python_source, restore_contents
 from cosmic_ray.work_item import MutationSpec, TestOutcome, WorkResult, WorkerOutcome
+
 from typing import Optional
+from collections import defaultdict
 import json
 
-log = logging.getLogger(__name__)
+with open('app.log', 'w') as f:
+    f.write('')
+
+# logging.basicConfig(level=logging.DEBUG)
+# log = logging.getLogger(__name__)
+# file_handler = logging.FileHandler('app.log', mode='a')
+# formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+# file_handler.setFormatter(formatter)
+# log.addHandler(file_handler)
 
 
 # pylint: disable=R0913
@@ -269,12 +280,33 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                 original_code, mutated_code = get_mutation(mutation.module_path, operator, mutation.occurrence)
                 status = 'mutated' if mutated_code is not None else 'no_mutation'
 
-                context_node = find_context(mutated_code, mutation.start_pos[0])
+                context_original_code = find_context(original_code, mutation.start_pos[0])
+                context_mutated_node = find_context(mutated_code, mutation.start_pos[0])
+                context = extract_focal_context(original_code, mutation.start_pos[0])
 
-                if context_node:
-                    node_source = ast.get_source_segment(mutated_code, context_node)
+                if context_mutated_node:
+                    node_source = ast.get_source_segment(mutated_code, context_mutated_node)
                 else:
                     node_source = None
+
+                if context_original_code:
+                    original_node_source = ast.get_source_segment(original_code, context_original_code)
+                else:
+                    original_node_source = None
+
+                original_code, mutated_code = get_mutation(mutation.module_path, operator, mutation.occurrence)
+                status = 'mutated' if mutated_code is not None else 'no_mutation'
+
+                context_node = find_context(mutated_code, mutation.start_pos[0])
+                log.debug(f"Context node {context_node.__class__.__name__} for mutation at {mutation.module_path}:{mutation.start_pos[0]}" if context_node else f"No context node found for mutation at {mutation.module_path}:{mutation.start_pos[0]}")
+
+                if context_node:
+                    log.debug("!!!!!!!!!!!!!!!!!Found context node for mutation at %s:%s", mutation.module_path, mutation.start_pos[0])
+                    node_source = ast.get_source_segment(mutated_code, context_node)
+                    log.debug(f"Extracted node source:\n{node_source}")
+                else:
+                    node_source = None
+
 
                 diff_lines = _make_diff(original_code, mutated_code, mutation.module_path) if mutated_code else []
                 mutation_records.append({
@@ -285,6 +317,8 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
                     "end_pos": mutation.end_pos,
                     "operator_args": getattr(mutation, 'operator_args', {}),
                     "mutation": extract_mutated_line(mutated_code, mutation.start_pos, mutation.end_pos) if mutated_code else None,
+                    "original_code": original_node_source,
+                    "context": context["focal_context"] if context else None,
                     "mutated_code": node_source,
                     "diff": "\n".join(diff_lines) if diff_lines else None,
                     "status": status,
@@ -363,8 +397,35 @@ def get_mutations_only(mutations: Iterable[MutationSpec]) -> WorkResult:
         )
 
 
+# def find_context(code: str, line: int):
+#     try:
+#         tree = ast.parse(code)
+#     except (SyntaxError, ValueError):
+#         log.error("Failed to parse code for context extraction", exc_info=True)
+#         return None
+
+#     def node_span(node):
+#         if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+#             return node.lineno, node.end_lineno
+#         if hasattr(node, "lineno"):
+#             return node.lineno, node.lineno
+#         return None
+
+#     enclosing = None
+#     for node in ast.walk(tree):
+#         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+#             span = node_span(node)
+#             if span and span[0] <= line <= span[1]:
+#                 if enclosing is None or span[0] >= enclosing[1][0]:
+#                     enclosing = (node, span)
+#     return enclosing[0] if enclosing else None
+
 def find_context(code: str, line: int):
-    tree = ast.parse(code)
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        log.warning("Failed to parse code for context extraction", exc_info=True)
+        return None
 
     def node_span(node):
         if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
@@ -378,8 +439,9 @@ def find_context(code: str, line: int):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             span = node_span(node)
             if span and span[0] <= line <= span[1]:
-                if enclosing is None or span[0] >= enclosing[1]:
+                if enclosing is None or span[0] >= enclosing[1][0]:
                     enclosing = (node, span)
+
     return enclosing[0] if enclosing else None
 
 def extract_mutated_line(code: str, start_pos: list[int], end_pos: list[int]) -> str:
@@ -394,3 +456,162 @@ def extract_mutated_line(code: str, start_pos: list[int], end_pos: list[int]) ->
     start_idx = start_line - 1
 
     return lines[start_idx]
+
+def get_method_sig(method: ast.FunctionDef, indent=0):
+    s = ''
+    s += f'{"    " * indent}def {method.name}('
+    s += ast.unparse(method.args)
+    s += ')'
+    if method.returns:
+        s += ' -> ' + ast.unparse(method.returns)
+    s += ': ...\n'
+    return s
+
+
+def get_context(focalmethod: ast.FunctionDef, focalclass: ast.ClassDef, globals_funcs, tree: ast.Module):
+    """
+    Build complete context including imports, type definitions, and focal method/class.
+    
+    Args:
+        focalmethod: The focal method AST node
+        focalclass: The focal class AST node (if method is in a class)
+        globals_funcs: List of global-level functions
+        tree: The complete AST tree
+    
+    Returns:
+        Dictionary with 'focal_context' key containing the formatted context string
+    """
+    ctx = {}
+    focal_parts = []
+    
+    # Step 1: Extract imports and global type definitions
+    imports = []
+    type_defs = []
+    
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.append(ast.unparse(node))
+        elif isinstance(node, (ast.ClassDef, ast.Assign, ast.AnnAssign)):
+            # Skip the focal class, we'll add it separately with full detail
+            if focalclass and isinstance(node, ast.ClassDef) and node.name == focalclass.name:
+                continue
+            type_defs.append(ast.unparse(node))
+    
+    # Add imports first
+    if imports:
+        focal_parts.extend(imports)
+        focal_parts.append('')  # Empty line after imports
+    
+    # Add global type definitions
+    if type_defs:
+        focal_parts.extend(type_defs)
+        focal_parts.append('')  # Empty line after type definitions
+
+    # Step 2: Build focal class/method context
+    focal = ''
+    if focalclass:
+        # Focal method is inside a class
+        focal += f'class {focalclass.name}('
+        if focalclass.bases:
+            focal += ast.unparse(focalclass.bases)
+        focal += '):' + '\n'
+
+        # Add the focal method (full implementation)
+        s = ast.unparse(focalmethod) + '\n'
+        focal += re.sub(r'^', '    ', s, flags=re.MULTILINE)
+
+        # Add signatures of other methods in the class
+        funcs = [n for n in focalclass.body if (isinstance(n, ast.AsyncFunctionDef) or isinstance(n, ast.FunctionDef)) and n != focalmethod]
+        if funcs:
+            focal += '\n'
+            for f in funcs:
+                focal += get_method_sig(f, 1)
+
+        # Add instance attributes from __init__
+        init = [f for f in funcs if f.name == '__init__']
+        if init:
+            init = init[0]
+            assigns = [ast.unparse(n) for n in init.body if isinstance(n, ast.Assign)]
+            assigns = [a for a in assigns if a.startswith('self.')]
+            if assigns:
+                focal += '\n'
+                for a in assigns:
+                    focal += '    ' + a + '\n'
+
+        # Add class attributes
+        attrs = [ast.unparse(n) for n in focalclass.body if isinstance(n, ast.Assign)]
+        if attrs:
+            focal += '\n'
+            for a in attrs:
+                focal += '    ' + a + '\n'
+    else:
+        # Focal method is a standalone function
+        focal += ast.unparse(focalmethod)
+
+        # Add signatures of other global functions
+        if globals_funcs:
+            focal += '\n'
+            for m in globals_funcs:
+                focal += get_method_sig(m)
+
+    focal_parts.append(focal)
+
+    # Assemble final context
+    ctx['focal_context'] = '\n'.join(focal_parts)
+
+    return ctx
+
+
+def extract_focal_context(source: str, line: int) -> dict:
+    """
+    Extract complete context for LLM test generation, including imports,
+    type definitions, and the focal method with surrounding context.
+    
+    Args:
+        source: Complete source code string
+        line: Line number (1-indexed) of the focal element
+    
+    Returns:
+        Dictionary with 'focal_context' key containing the formatted context,
+        or None if parsing fails or focal method not found
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {'focal_context': None}
+
+    # Set parent attributes on all nodes for traversal
+    tree.parent = None
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child.parent = node
+
+    # Collect global-level functions
+    globals_funcs = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.parent == tree:
+                globals_funcs.append(node)
+
+    # Find the focal method (innermost function containing the line)
+    focalclass = None
+    focalmethod = None
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if hasattr(node, 'lineno') and hasattr(node, 'end_lineno'):
+                if node.lineno <= line <= node.end_lineno:
+                    if focalmethod is None or node.lineno > focalmethod.lineno:
+                        focalmethod = node
+
+    if focalmethod is None:
+        return {'focal_context': None}
+    
+    # Check if focal method is inside a class
+    if isinstance(focalmethod.parent, ast.ClassDef):
+        focalclass = focalmethod.parent
+
+    # Build the complete context
+    ctx = get_context(focalmethod, focalclass, globals_funcs, tree)
+
+    return ctx
